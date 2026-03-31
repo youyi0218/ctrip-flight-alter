@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+
+# Local runtime data
+config.json
+cookie.json
+onebot-config.json
+temp_test_config.json
+.flight_monitor_history.json
+.flight_monitor_state.json
+
+# Debug / capture artifacts
+debug_*.html
+debug_*.png
+rendered_page.html
+sample_qunar.html
+domestic_oneway_new.js
+pushplustoken.txt
+url.txt
+*.jpg
+*.jpeg
+
+# OS / editor
+.DS_Store
+Thumbs.db
