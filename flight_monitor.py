@@ -575,6 +575,81 @@ def parse_flights(route: dict[str, Any], payload: dict[str, Any]) -> list[Ticket
     return [parse_ticket(route, flight) for flight in flights if isinstance(flight, dict)]
 
 
+def parse_day_offset_note(value: Any) -> int:
+    match = re.search(r"\+(\d+)\s*天", str(value or ""))
+    return int(match.group(1)) if match else 0
+
+
+def compute_total_duration_from_schedule(departure_date: str, departure_time: str, arrival_time: str, arrival_day_offset: int) -> str:
+    dep_dt = parse_datetime_ymd_hm(departure_date, departure_time)
+    dep_day = parse_iso_date(departure_date)
+    if not dep_dt or not dep_day:
+        return ""
+    arr_day = dep_day + timedelta(days=max(0, arrival_day_offset))
+    arr_dt = parse_datetime_ymd_hm(arr_day.strftime("%Y-%m-%d"), arrival_time)
+    if not arr_dt:
+        return ""
+    return humanize_minutes(int((arr_dt - dep_dt).total_seconds() // 60))
+
+
+def parse_display_ticket(route: dict[str, Any], row: dict[str, Any]) -> Ticket:
+    arrival_day_offset = parse_day_offset_note(row.get("arrival_day_note"))
+    arrival_date = (
+        (parse_iso_date(route["departure_date"]) or date.today()) + timedelta(days=arrival_day_offset)
+    ).strftime("%Y-%m-%d")
+    range_text = normalize_duration_text(row.get("range_text"))
+    total_duration = compute_total_duration_from_schedule(
+        route["departure_date"],
+        str(row.get("departure_time") or ""),
+        str(row.get("arrival_time") or ""),
+        arrival_day_offset,
+    )
+    if not total_duration:
+        total_duration = range_text if "停留" not in range_text else ""
+    flight_duration = range_text if range_text and "停留" not in range_text else total_duration
+    discount = str(row.get("discount") or "").strip()
+    labels = dedupe_in_order([str(item).strip() for item in (row.get("labels") or []) if str(item).strip()])
+    if discount and discount not in labels:
+        labels = [discount] + labels
+    flight_type = str(row.get("flight_type") or "").strip() or "直飞"
+    return Ticket(
+        route=f"{route['departure_city']} → {route['arrival_city']}",
+        departure_city=route["departure_city"],
+        arrival_city=route["arrival_city"],
+        departure_date=route["departure_date"],
+        arrival_date=arrival_date,
+        arrival_day_offset=arrival_day_offset,
+        flight_type=flight_type,
+        airlines=str(row.get("airlines") or "").strip(),
+        flight_numbers=str(row.get("flight_numbers") or "").strip(),
+        departure_time=str(row.get("departure_time") or "").strip(),
+        arrival_time=str(row.get("arrival_time") or "").strip(),
+        departure_airport=str(row.get("departure_airport") or "").strip(),
+        arrival_airport=str(row.get("arrival_airport") or "").strip(),
+        total_duration=total_duration,
+        flight_duration=flight_duration,
+        transfer_city=str(row.get("transfer_city") or "").strip(),
+        transfer_duration=normalize_duration_text(row.get("transfer_duration")),
+        price=int(row.get("price") or 0),
+        discount=discount,
+        labels=labels,
+        segments=[],
+    )
+
+
+def parse_display_tickets(route: dict[str, Any], rows: list[dict[str, Any]]) -> list[Ticket]:
+    tickets: list[Ticket] = []
+    for row in rows:
+        if not str(row.get("price") or "").isdigit():
+            continue
+        try:
+            tickets.append(parse_display_ticket(route, row))
+        except Exception:
+            continue
+    tickets.sort(key=lambda item: (item.price, item.departure_time, item.arrival_time, item.flight_numbers))
+    return tickets
+
+
 def format_segment_line(segment: FlightSegment) -> str:
     aircraft = f"｜{segment.aircraft}" if segment.aircraft else ""
     arrive_suffix = f" {segment.arrival_day_note}" if segment.arrival_day_note else ""
@@ -1225,11 +1300,18 @@ class QunarMonitor:
 
     async def _extract_visible_prices(self, page: Page) -> list[dict[str, Any]]:
         return await page.evaluate(
-            """() => Array.from(document.querySelectorAll('.b-airfly')).map(card => {
+            """() => {
+                const clean = value => (value || '').replace(/[\\t\\r\\n]+/g, ' ').replace(/\\s+/g, ' ').trim();
+                const airportText = container => {
+                  if (!container) return '';
+                  return clean(Array.from(container.querySelectorAll('.airport span')).map(el => clean(el.textContent)).join(''));
+                };
+                return Array.from(document.querySelectorAll('.b-airfly')).map(card => {
                 const text = sel => {
                   const el = card.querySelector(sel);
-                  return el ? (el.textContent || '').trim() : '';
+                  return el ? clean(el.textContent || '') : '';
                 };
+                const texts = sel => Array.from(card.querySelectorAll(sel)).map(el => clean(el.textContent || '')).filter(Boolean);
                 const fix = card.querySelector('.fix_price');
                 const prc = card.querySelector('.prc');
                 let price = '';
@@ -1241,13 +1323,31 @@ class QunarMonitor:
                 }
                 const cardText = (card.innerText || '').toUpperCase();
                 const flightNumbers = Array.from(new Set(cardText.match(/\\b[A-Z0-9]{2,3}\\d{3,4}\\b/g) || []));
+                const airlineNames = texts('.col-airline .air span');
+                const labelTexts = texts('.vim .v');
+                const transferText = text('.trans .g-up-tips .t');
+                const transferCityMatch = transferText.match(/转\\s*(.+)/);
+                const segTransferText = texts('.seg.transfer').find(Boolean) || '';
+                const transferDurationMatch = segTransferText.match(/(?:转机时间|停留时间?)[:：]?\\s*(.+)$/);
+                const daycross = text('.sep-rt .daycross span');
+                const fullText = clean(card.innerText || '');
                 return {
                   price,
+                  airlines: airlineNames.join(' / '),
                   flight_numbers: flightNumbers.join('/'),
                   departure_time: text('.sep-lf h2'),
-                  arrival_time: text('.sep-rt h2')
+                  arrival_time: text('.sep-rt h2'),
+                  departure_airport: airportText(card.querySelector('.sep-lf')),
+                  arrival_airport: airportText(card.querySelector('.sep-rt')),
+                  range_text: text('.sep-ct .range'),
+                  arrival_day_note: daycross,
+                  transfer_city: transferCityMatch ? clean(transferCityMatch[1]) : '',
+                  transfer_duration: transferDurationMatch ? clean(transferDurationMatch[1]) : '',
+                  discount: labelTexts[0] || '',
+                  labels: labelTexts,
+                  flight_type: fullText.includes('经停') ? '经停' : (flightNumbers.length > 1 || transferText ? '中转' : '直飞')
                 };
-            })"""
+            })}"""
         )
 
     async def _collect_display_prices(self, page: Page) -> list[dict[str, Any]]:
@@ -1573,10 +1673,21 @@ async def collect_route_results(
             continue
         url, payload, display_rows = await monitor.fetch_route_payload(route)
         code = int(payload.get("code", -1))
-        if code != 0:
-            raise RuntimeError(f"去哪儿接口返回异常: {payload}")
-        tickets = parse_flights(route, payload)
-        apply_display_prices(tickets, display_rows)
+        if code == 0:
+            tickets = parse_flights(route, payload)
+            apply_display_prices(tickets, display_rows)
+        elif display_rows:
+            safe_output(
+                f"警告：去哪儿接口返回 code={code}，已自动切换为页面 DOM 兜底解析："
+                f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+            )
+            tickets = parse_display_tickets(route, display_rows)
+        else:
+            safe_output(
+                f"警告：去哪儿接口返回 code={code}，且页面未解析到机票卡片，按空结果处理："
+                f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+            )
+            tickets = []
         update_price_history(history, config, route, tickets, current_time)
         matched_tickets = filter_tickets_for_route(route, tickets)
         results.append(
