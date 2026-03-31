@@ -141,6 +141,13 @@ class Ticket:
     segments: list[FlightSegment]
 
 
+@dataclass(frozen=True)
+class ScheduleOccurrence:
+    slot: str
+    slot_time: datetime
+    slot_key: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="去哪儿机票价格监控与 PushPlus 推送")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
@@ -268,7 +275,7 @@ def ensure_config(path: Path) -> dict[str, Any]:
         "service",
         {
             "timezone": "Asia/Shanghai",
-            "poll_interval_seconds": 900,
+            "capture_lead_minutes": 10,
             "schedule_times": ["09:00"],
             "sleep_cap_seconds": 60,
             "schedule_grace_seconds": 300,
@@ -1452,8 +1459,12 @@ def normalize_schedule_value(value: str) -> str:
     return value.strip()
 
 
+def slot_key_for_datetime(slot_time: datetime, slot: str) -> str:
+    return f"{slot_time.strftime('%Y-%m-%d')} {normalize_schedule_value(slot)}"
+
+
 def current_slot_key(now: datetime, slot: str) -> str:
-    return f"{now.strftime('%Y-%m-%d')} {normalize_schedule_value(slot)}"
+    return slot_key_for_datetime(now, slot)
 
 
 def slot_to_datetime(now: datetime, slot: str) -> datetime:
@@ -1461,18 +1472,57 @@ def slot_to_datetime(now: datetime, slot: str) -> datetime:
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
+def iter_schedule_occurrences(
+    now: datetime,
+    schedule_times: list[str],
+    day_offsets: tuple[int, ...],
+) -> list[ScheduleOccurrence]:
+    occurrences: list[ScheduleOccurrence] = []
+    for day_offset in day_offsets:
+        base = now + timedelta(days=day_offset)
+        for slot in schedule_times:
+            normalized_slot = normalize_schedule_value(slot)
+            slot_time = slot_to_datetime(base, normalized_slot)
+            occurrences.append(
+                ScheduleOccurrence(
+                    slot=normalized_slot,
+                    slot_time=slot_time,
+                    slot_key=slot_key_for_datetime(slot_time, normalized_slot),
+                )
+            )
+    occurrences.sort(key=lambda item: item.slot_time)
+    return occurrences
+
+
+def get_due_capture_slots(
+    now: datetime,
+    schedule_times: list[str],
+    state: dict[str, Any],
+    captured_slot_keys: set[str],
+    capture_lead_seconds: int,
+) -> list[ScheduleOccurrence]:
+    due: list[ScheduleOccurrence] = []
+    lead_seconds = max(0, int(capture_lead_seconds))
+    for occurrence in iter_schedule_occurrences(now, schedule_times, (0, 1)):
+        if occurrence.slot_key in captured_slot_keys or is_slot_sent(state, occurrence.slot_key):
+            continue
+        capture_time = occurrence.slot_time - timedelta(seconds=lead_seconds)
+        if capture_time <= now < occurrence.slot_time:
+            due.append(occurrence)
+    return due
+
+
 def get_due_slots(
     now: datetime,
     schedule_times: list[str],
     state: dict[str, Any],
     grace_seconds: int,
-) -> list[str]:
-    due: list[str] = []
-    for slot in schedule_times:
-        slot_time = slot_to_datetime(now, slot)
-        delta = (now - slot_time).total_seconds()
-        if 0 <= delta <= grace_seconds and not is_slot_sent(state, current_slot_key(now, slot)):
-            due.append(slot)
+) -> list[ScheduleOccurrence]:
+    due: list[ScheduleOccurrence] = []
+    for occurrence in iter_schedule_occurrences(now, schedule_times, (-1, 0)):
+        delta = (now - occurrence.slot_time).total_seconds()
+        if 0 <= delta <= grace_seconds and not is_slot_sent(state, occurrence.slot_key):
+            due.append(occurrence)
     return due
 
 
@@ -1483,6 +1533,29 @@ def seconds_until_next_schedule(now: datetime, schedule_times: list[str]) -> int
         if target <= now:
             target = target + timedelta(days=1)
         candidates.append(target)
+    if not candidates:
+        return 3600
+    delta = min(candidates) - now
+    return max(1, int(delta.total_seconds()))
+
+
+def seconds_until_next_capture(
+    now: datetime,
+    schedule_times: list[str],
+    state: dict[str, Any],
+    captured_slot_keys: set[str],
+    capture_lead_seconds: int,
+) -> int:
+    lead_seconds = max(0, int(capture_lead_seconds))
+    candidates: list[datetime] = []
+    for occurrence in iter_schedule_occurrences(now, schedule_times, (0, 1)):
+        if occurrence.slot_key in captured_slot_keys or is_slot_sent(state, occurrence.slot_key):
+            continue
+        capture_time = occurrence.slot_time - timedelta(seconds=lead_seconds)
+        if capture_time <= now < occurrence.slot_time:
+            return 1
+        if capture_time > now:
+            candidates.append(capture_time)
     if not candidates:
         return 3600
     delta = min(candidates) - now
@@ -1638,8 +1711,35 @@ def content_changed(previous: str, current: str) -> bool:
 
 
 def cleanup_sent_slots(state: dict[str, Any], config: dict[str, Any]) -> None:
-    today = today_key(config)
-    state["sent_slots"] = [slot for slot in state.get("sent_slots", []) if str(slot).startswith(today)]
+    now = now_in_timezone(config)
+    valid_days = {
+        (now + timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in (-1, 0)
+    }
+    state["sent_slots"] = [
+        slot for slot in state.get("sent_slots", []) if str(slot).split(" ", 1)[0] in valid_days
+    ]
+
+
+def cleanup_runtime_slot_cache(
+    now: datetime,
+    slot_snapshots: dict[str, list[dict[str, Any]]],
+    captured_slot_keys: set[str],
+) -> None:
+    valid_days = {
+        (now + timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in (-1, 0, 1)
+    }
+    for slot_key in list(slot_snapshots.keys()):
+        if str(slot_key).split(" ", 1)[0] not in valid_days:
+            slot_snapshots.pop(slot_key, None)
+    captured_slot_keys.intersection_update(
+        {
+            slot_key
+            for slot_key in captured_slot_keys
+            if str(slot_key).split(" ", 1)[0] in valid_days
+        }
+    )
 
 
 def is_slot_sent(state: dict[str, Any], slot_key: str) -> bool:
@@ -1841,7 +1941,8 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
     service_cfg = config.get("service", {})
     onebot_cfg = load_onebot_config()
     email_cfg = config.get("email", {})
-    poll_interval = max(60, int(service_cfg.get("poll_interval_seconds", 900)))
+    capture_lead_minutes = max(0, int(service_cfg.get("capture_lead_minutes", 10)))
+    capture_lead_seconds = capture_lead_minutes * 60
     sleep_cap = max(10, int(service_cfg.get("sleep_cap_seconds", 60)))
     grace_seconds = max(30, int(service_cfg.get("schedule_grace_seconds", 300)))
     schedule_times = [normalize_schedule_value(item) for item in service_cfg.get("schedule_times", ["09:00"])]
@@ -1852,29 +1953,47 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
     history = load_history(history_file)
     cleanup_sent_slots(state, config)
 
-    latest_route_results: list[dict[str, Any]] = []
-    latest_capture_time: datetime | None = None
+    slot_snapshots: dict[str, list[dict[str, Any]]] = {}
+    captured_slot_keys: set[str] = set()
 
     async with QunarMonitor(config, Path(config["cookie_file"])) as monitor:
         while True:
             now = now_in_timezone(config)
             cleanup_sent_slots(state, config)
-            due_slots = get_due_slots(now, schedule_times, state, grace_seconds)
-            need_capture = (
-                latest_capture_time is None
-                or (now - latest_capture_time).total_seconds() >= poll_interval
-                or bool(due_slots)
-            )
+            cleanup_runtime_slot_cache(now, slot_snapshots, captured_slot_keys)
 
-            if need_capture:
-                latest_route_results = await collect_route_results(config, monitor, history, now)
-                latest_capture_time = now
-                print_route_results(latest_route_results, f"{current_title(now)}｜抓取完成")
+            due_capture_slots = get_due_capture_slots(
+                now,
+                schedule_times,
+                state,
+                captured_slot_keys,
+                capture_lead_seconds,
+            )
+            if due_capture_slots:
+                route_results = await collect_route_results(config, monitor, history, now)
+                for occurrence in due_capture_slots:
+                    slot_snapshots[occurrence.slot_key] = route_results
+                    captured_slot_keys.add(occurrence.slot_key)
+                print_route_results(route_results, f"{current_title(now)} pre-capture complete")
                 if not dry_run:
                     save_history(history_file, history)
 
+            due_slots = get_due_slots(now, schedule_times, state, grace_seconds)
             if due_slots:
-                notification_items = build_notification_items(config, latest_route_results, history, now)
+                push_occurrence = due_slots[-1]
+                route_results = slot_snapshots.get(push_occurrence.slot_key)
+                if route_results is None:
+                    safe_output(
+                        f"Missing pre-capture snapshot for {push_occurrence.slot}; collecting once immediately before push."
+                    )
+                    route_results = await collect_route_results(config, monitor, history, now)
+                    slot_snapshots[push_occurrence.slot_key] = route_results
+                    captured_slot_keys.add(push_occurrence.slot_key)
+                    print_route_results(route_results, f"{current_title(now)} fallback capture complete")
+                    if not dry_run:
+                        save_history(history_file, history)
+
+                notification_items = build_notification_items(config, route_results, history, now)
                 title = current_title(now)
                 should_push = bool(notification_items)
                 if should_push and not dry_run:
@@ -1885,10 +2004,12 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
                         for item in notification_items:
                             send_resend_email(email_cfg, item["title"], item["html"], item["text"])
                 elif not should_push:
-                    safe_output(f"{title}：当前没有低于预期价格的机票，已跳过推送。")
+                    safe_output(f"{title}: no tickets below the expected price, skipped push.")
 
-                for slot in due_slots:
-                    mark_slot_sent(state, current_slot_key(now, slot))
+                for occurrence in due_slots:
+                    mark_slot_sent(state, occurrence.slot_key)
+                    slot_snapshots.pop(occurrence.slot_key, None)
+                    captured_slot_keys.discard(occurrence.slot_key)
                 if not dry_run:
                     save_state_if_needed(state_file, state)
 
@@ -1897,8 +2018,8 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
                         json.dumps(
                             {
                                 "title": title,
-                                "due_slots": due_slots,
-                                "route_results": serialize_route_results(latest_route_results),
+                                "due_slots": [occurrence.slot for occurrence in due_slots],
+                                "route_results": serialize_route_results(route_results),
                                 "notification_count": len(notification_items),
                             },
                             ensure_ascii=False,
@@ -1906,13 +2027,17 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
                         )
                     )
 
-            next_capture_delay = poll_interval
-            if latest_capture_time is not None:
-                next_capture_delay = max(1, int(poll_interval - (now - latest_capture_time).total_seconds()))
-            next_schedule_delay = seconds_until_next_schedule(now, schedule_times)
+            sleep_now = now_in_timezone(config)
+            next_capture_delay = seconds_until_next_capture(
+                sleep_now,
+                schedule_times,
+                state,
+                captured_slot_keys,
+                capture_lead_seconds,
+            )
+            next_schedule_delay = seconds_until_next_schedule(sleep_now, schedule_times)
             sleep_seconds = max(10, min(sleep_cap, next_capture_delay, next_schedule_delay))
             await asyncio.sleep(sleep_seconds)
-
 
 def main() -> int:
     args = parse_args()

@@ -42,6 +42,7 @@ cp config.example.json config.json
 - `email.from`
 - `email.to`
 - `service.schedule_times`
+- `service.capture_lead_minutes` (defaults to `10`)
 - `routes`
 
 标题格式：
@@ -75,6 +76,8 @@ python flight_monitor.py --dry-run --dump-json
 ```bash
 python flight_monitor.py --service
 ```
+
+Service mode now captures prices only once per schedule, `capture_lead_minutes` before the push time, and pushes at the configured `schedule_times`.
 
 ## Docker
 

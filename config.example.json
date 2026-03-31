@@ -46,7 +46,7 @@
     "timezone": "Asia/Shanghai",
 
     // 后台抓取轮询间隔（秒）
-    "poll_interval_seconds": 1800,
+    "capture_lead_minutes": 10,
 
     // 每天定时推送时间
     "schedule_times": [
