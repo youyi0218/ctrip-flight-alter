@@ -24,20 +24,21 @@ RUN apt-get update \
 
 # Create a non-root user (Chromium cannot run as root without --no-sandbox).
 RUN useradd -m -u 10001 -s /usr/sbin/nologin app \
-    && mkdir -p /app \
-    && chown -R app:app /app
+    && mkdir -p /app /opt/qunar-flight-alter-seed \
+    && chown -R app:app /app /opt/qunar-flight-alter-seed
 
-WORKDIR /app
+WORKDIR /opt/qunar-flight-alter-seed
 COPY requirements.txt ./
 RUN python -m pip install -r requirements.txt
 
-COPY flight_monitor.py ./
+COPY flight_monitor.py README.md config.example.json docker-entrypoint.sh ./
+RUN chmod +x /opt/qunar-flight-alter-seed/docker-entrypoint.sh
 
 USER app
 
 # Runtime working directory (mount the whole project here if desired).
 WORKDIR /app
 
-ENTRYPOINT ["dumb-init", "--"]
+ENTRYPOINT ["dumb-init", "--", "/opt/qunar-flight-alter-seed/docker-entrypoint.sh"]
 CMD ["python", "/app/flight_monitor.py", "--service"]
 

@@ -119,14 +119,27 @@ docker run -d \
 - `.flight_monitor_history.json`
 - `.flight_monitor_state.json`
 
+如果当前目录里还没有程序文件，容器首次启动时会自动补出这些文件：
+
+- `flight_monitor.py`
+- `config.example.json`
+- `README.md`
+- `requirements.txt`
+
 首次部署：
+
+```bash
+docker login ghcr.io -u youyi0218
+docker compose pull
+docker compose up -d
+```
+
+如果第一次启动后当前目录里还没有 `config.json`，就再执行：
 
 ```bash
 cp config.example.json config.json
 # 再把你自己的 cookie.json 放到当前目录
-docker login ghcr.io -u youyi0218
-docker compose pull
-docker compose up -d
+docker compose restart
 ```
 
 查看日志：
